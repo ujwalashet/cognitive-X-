@@ -1,0 +1,24 @@
+# Virtual environments
+venv/
+frontend/venv/
+backend/venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# SQLite database
+backend/saferx.db
+
+# Reports
+backend/reports/
+
+# Streamlit cache
+frontend/.streamlit/
+
+# Environment files
+*.env
+
+# IDE settings
+.vscode/
+.idea/

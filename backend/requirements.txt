@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+python-multipart
+transformers
+torch
+requests
+pillow
+pytesseract
+fpdf
+pydantic
+pymongo
+python-jose
