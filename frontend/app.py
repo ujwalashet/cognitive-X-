@@ -372,27 +372,40 @@ def upload_page():
             else:
                 st.warning("Please enter prescription text")
 
-def analyze_prescription(text):
-    """Analyze prescription and display results"""
+def analyze_prescription(text=None):
+    """Analyze prescription and display results (improved)"""
+    # ✅ Always prefer the latest edited text
+    edited_text = st.session_state.get("extracted_edit", "")
+    text_to_analyze = edited_text.strip() if edited_text.strip() else (text.strip() if text else "")
+
+    if not text_to_analyze:
+        st.warning("⚠️ No prescription text found. Please upload or enter text.")
+        return
+
+    # ✅ Clear old analysis
+    st.session_state.analysis_result = None
+
+    # Debug output to confirm text being sent
+    st.info("🔎 Sending this text to backend for analysis:")
+    st.code(text_to_analyze[:500])  # show first 500 characters
+
     with st.spinner("🔬 Analyzing prescription..."):
         result, error = api_request(
             "/analyze/text",
             method="POST",
             data={
-                "text": text,
-                "user_email": st.session_state.user.get("email")
+                "text": text_to_analyze,
+                "user_email": st.session_state.user.get("email", "test@example.com")
             }
         )
-        
+
         if result:
             st.session_state.analysis_result = result
             st.success("✅ Analysis complete!")
+            st.write("🧠 Extracted Drugs:", [d.get("name") for d in result.get("drugs", [])])
             navigate_to('results')
         else:
             st.error(f"Analysis failed: {error}")
-
-
-
 def results_page():
     """Display Analysis Results"""
     with st.sidebar:

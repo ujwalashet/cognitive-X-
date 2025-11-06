@@ -223,46 +223,59 @@ def fallback_drug_extraction(text: str) -> List[Dict[str, Any]]:
     return found_drugs
 
 def check_drug_interactions(drugs: List[str]) -> List[Dict[str, Any]]:
-    """Check drug interactions using RxNav API"""
+    """Check drug interactions using fallback database (case-insensitive)"""
     interactions = []
-    
-    try:
-        for i, drug1 in enumerate(drugs):
-            # Get RxCUI for drug
-            rxcui_url = f"https://rxnav.nlm.nih.gov/REST/rxcui.json?name={drug1}"
-            response = requests.get(rxcui_url, timeout=5)
-            
-            if response.status_code != 200:
-                continue
-                
-            data = response.json()
-            if 'idGroup' not in data or 'rxnormId' not in data['idGroup']:
-                continue
-                
-            rxcui = data['idGroup']['rxnormId'][0]
-            
-            # Check interactions
-            interaction_url = f"https://rxnav.nlm.nih.gov/REST/interaction/interaction.json?rxcui={rxcui}"
-            int_response = requests.get(interaction_url, timeout=5)
-            
-            if int_response.status_code == 200:
-                int_data = int_response.json()
-                if 'interactionTypeGroup' in int_data:
-                    for group in int_data['interactionTypeGroup']:
-                        for interaction_type in group.get('interactionType', []):
-                            for pair in interaction_type.get('interactionPair', []):
-                                interactions.append({
-                                    "drug1": drug1,
-                                    "drug2": pair['interactionConcept'][1]['minConceptItem']['name'],
-                                    "description": pair['description'],
-                                    "severity": pair.get('severity', 'Unknown')
-                                })
-    except Exception as e:
-        print(f"RxNav API error: {e}")
-        # Fallback to predefined interactions
-        interactions = get_fallback_interactions(drugs)
-    
+
+    # Normalize drug names for consistency
+    normalized_drugs = [d.strip().capitalize() for d in drugs]
+
+    # Fallback database (case-insensitive)
+    fallback_db = {
+        frozenset(["Ibuprofen", "Aspirin"]): {
+            "description": "Both are NSAIDs and can cause stomach bleeding or ulcers when taken together.",
+            "severity": "High",
+        },
+        frozenset(["Amoxicillin", "Methotrexate"]): {
+            "description": "Amoxicillin can increase Methotrexate toxicity and cause side effects.",
+            "severity": "High",
+        },
+        frozenset(["Ibuprofen", "Lisinopril"]): {
+            "description": "Ibuprofen may reduce the effectiveness of Lisinopril and affect kidney function.",
+            "severity": "Moderate",
+        },
+        frozenset(["Aspirin", "Warfarin"]): {
+            "description": "Both thin blood and can cause severe bleeding when combined.",
+            "severity": "High",
+        },
+        frozenset(["Paracetamol", "Alcohol"]): {
+            "description": "May increase risk of liver damage if used together regularly.",
+            "severity": "Moderate",
+        },
+    }
+
+    # Check all pairs for matches (case-insensitive using frozenset)
+    for i in range(len(normalized_drugs)):
+        for j in range(i + 1, len(normalized_drugs)):
+            d1, d2 = normalized_drugs[i], normalized_drugs[j]
+            pair_key = frozenset([d1, d2])
+
+            if pair_key in fallback_db:
+                data = fallback_db[pair_key]
+                interactions.append({
+                    "drug1": d1,
+                    "drug2": d2,
+                    "description": data["description"],
+                    "severity": data["severity"]
+                })
+
+    # Debug output
+    if not interactions:
+        print(f"[DEBUG] No interactions found for {normalized_drugs}")
+    else:
+        print(f"[DEBUG] Found interactions: {interactions}")
+
     return interactions
+
 
 def get_fallback_interactions(drugs: List[str]) -> List[Dict[str, Any]]:
     """Fallback interaction database"""
@@ -521,22 +534,28 @@ async def analyze_upload(file: UploadFile = File(None)):
 
 @app.post("/analyze/text")
 def analyze_text(prescription: PrescriptionText, token_data: dict = Depends(verify_token)):
-    """Analyze prescription text and extract drugs"""
-    # Extract drugs
+    """Analyze prescription text and extract drugs, interactions, and compute safety score"""
+
+    print("=== [DEBUG] /analyze/text called ===")
+    print("Incoming text (first 200 chars):", prescription.text[:200])
+
+    # --- Step 1: Extract drugs ---
     drugs = extract_drugs_nlp(prescription.text)
-    
     if not drugs:
+        print("[DEBUG] No drugs detected.")
         return {
             "drugs": [],
-            "message": "No drugs detected in the prescription text"
+            "message": "No drugs detected in the prescription text",
+            "safety_score": 20,
+            "risk_level": "High"
         }
-    
+
     drug_names = [d["name"] for d in drugs]
-    
-    # Get user age
+    print(f"[DEBUG] Extracted drugs: {drug_names}")
+
+    # --- Step 2: Get user age ---
     user_email = prescription.user_email
     age = 30  # Default
-    
     if USE_MONGODB:
         user = users_collection.find_one({"email": user_email})
         if user and user.get("age"):
@@ -546,22 +565,55 @@ def analyze_text(prescription: PrescriptionText, token_data: dict = Depends(veri
         result = cursor.fetchone()
         if result and result[0]:
             age = result[0]
-    
-    # Check interactions
+    print(f"[DEBUG] User age: {age}")
+
+    # --- Step 3: Check interactions, dosage, and alternatives ---
     interactions = check_drug_interactions(drug_names)
-    
-    # Check dosage
     dosage_recommendations = check_dosage_by_age(drug_names, age)
-    
-    # Get alternatives
     alternatives = suggest_alternatives(drug_names)
-    
-    # Calculate safety score
-    safety_score = 100
-    if interactions:
-        safety_score -= len(interactions) * 15
-    safety_score = max(0, min(100, safety_score))
-    
+
+    # --- Step 4: Compute improved safety score ---
+    try:
+        confidences = []
+        for d in drugs:
+            c = d.get("confidence", 0.6)
+            if c > 1:  # normalize if score is in 0–100
+                c = c / 100.0
+            confidences.append(max(0.0, min(1.0, float(c))))
+        avg_conf = sum(confidences) / len(confidences) if confidences else 0.0
+
+        safety_score = int(100 * avg_conf)  # start based on confidence
+        debug_reason = [f"Base from confidence: {safety_score}"]
+
+        # Interaction penalty (based on severity)
+        severity_penalty = {"High": 30, "Moderate": 20, "Low": 10, "Unknown": 10}
+        total_penalty = 0
+        for inter in interactions:
+            sev = inter.get("severity", "Unknown")
+            total_penalty += severity_penalty.get(sev, 10)
+        if total_penalty:
+            safety_score -= total_penalty
+            debug_reason.append(f"-{total_penalty} for interactions")
+
+        # Penalize very short or meaningless text
+        if len(prescription.text.split()) < 5:
+            safety_score -= 20
+            debug_reason.append("-20 for too short/unclear text")
+
+        # If no drugs, limit to 40
+        if len(drugs) == 0:
+            safety_score = min(safety_score, 40)
+            debug_reason.append("Capped at 40 (no valid drugs)")
+
+        # Clamp value between 0 and 100
+        safety_score = max(0, min(100, safety_score))
+        print(f"[DEBUG] Safety score computed: {safety_score} | Reasons: {debug_reason}")
+
+    except Exception as e:
+        print("⚠️ Error computing safety score:", e)
+        safety_score = 50
+
+    # --- Step 5: Compile final result ---
     result = {
         "drugs": drugs,
         "interactions": interactions,
@@ -570,8 +622,10 @@ def analyze_text(prescription: PrescriptionText, token_data: dict = Depends(veri
         "safety_score": safety_score,
         "risk_level": "High" if safety_score < 40 else "Medium" if safety_score < 70 else "Low"
     }
-    
-    # Save to database
+
+    print(f"[DEBUG] Final result summary -> Drugs: {drug_names} | Score: {safety_score} | Risk: {result['risk_level']}")
+
+    # --- Step 6: Save analysis to database ---
     if USE_MONGODB:
         prescriptions_collection.insert_one({
             "user_email": user_email,
@@ -584,10 +638,17 @@ def analyze_text(prescription: PrescriptionText, token_data: dict = Depends(veri
             INSERT INTO prescriptions 
             (user_email, prescription_text, extracted_drugs, interactions, dosage_check, alternatives, safety_score)
             VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (user_email, prescription.text, json.dumps(drugs), json.dumps(interactions), 
-              json.dumps(dosage_recommendations), json.dumps(alternatives), safety_score))
+        """, (
+            user_email,
+            prescription.text,
+            json.dumps(drugs),
+            json.dumps(interactions),
+            json.dumps(dosage_recommendations),
+            json.dumps(alternatives),
+            safety_score
+        ))
         conn.commit()
-    
+
     return result
 
 @app.post("/interactions")
